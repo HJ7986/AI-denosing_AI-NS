@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI-TA principle</title>
+<style>
+  :root{--pump:#E2A23B;--probe:#2E9C8E;--sig:#C0392B;--ink:#1d2733;--bg:#fff;--panel:#f7f9fb;--accent:#2E5396;--trig:#6E59C7;--ifg:#C76A2E;--beam:#1F5FE0;}
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:"Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg);padding:14px;}
+  .wrap{max-width:1040px;margin:0 auto;}
+  h1{font-size:21px;margin:0 0 2px;} h1 small{color:var(--accent);font-weight:600;}
+  .sub{font-size:13.5px;color:#566;margin:0 0 10px;line-height:1.45;}
+  .stage{background:var(--panel);border:1px solid #e4e9ee;border-radius:12px;padding:8px;}
+  canvas{width:100%;height:auto;display:block;}
+  .controls{display:flex;flex-wrap:wrap;gap:14px 20px;align-items:center;margin-top:10px;font-size:13px;background:var(--panel);border:1px solid #e4e9ee;border-radius:10px;padding:10px 14px;}
+  button{font:inherit;font-weight:600;border:1px solid #cdd6df;background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;color:var(--ink);}
+  button:hover{background:#eef3f8;border-color:var(--accent);}
+  .ctl{display:flex;align-items:center;gap:8px;}
+  input[type=range]{width:130px;accent-color:var(--accent);}
+  .val{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:700;min-width:64px;}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:#445;margin-top:8px;}
+  .legend span{display:inline-flex;align-items:center;gap:6px;}
+  .dot{width:13px;height:13px;border-radius:3px;display:inline-block;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AI-TA scan — setup, overview &amp; zoom</h1>
+  <p class="sub">After the sample, a modified Mach&ndash;Zehnder interferometer scans the probe delay <b>&tau;</b> continuously
+     (moving stage, speed v). Each ASOPS cycle (1/&Delta;f<sub>r</sub>) records one TA decay <b>S(&tau;<sub>n</sub>, t)</b> from t&lt;0;
+     successive decays ride on the probe interferogram <b>I(&tau;)</b>.</p>
+
+  <div class="stage"><canvas id="c" width="1020" height="716"></canvas></div>
+
+  <div class="controls">
+    <button id="play">&#10074;&#10074; Pause</button>
+    <button id="restart">&#8635; Restart</button>
+    <div class="ctl"><label>Speed</label>
+      <input type="range" id="speed" min="0.25" max="3" step="0.05" value="1">
+      <span class="val" id="speedV">1.00&times;</span></div>
+  </div>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--beam)"></i>Beam</span>
+    <span><i class="dot" style="background:var(--sig);border-radius:50%"></i>TA decay S(&tau;<sub>n</sub>, t)</span>
+    <span><i class="dot" style="background:var(--ifg)"></i>Interferogram I(&tau;)</span>
+    <span><i class="dot" style="background:var(--pump)"></i>Pump</span>
+    <span><i class="dot" style="background:var(--probe)"></i>Probe</span>
+  </div>
+</div>
+
+<script>
+const cv=document.getElementById('c'), g=cv.getContext('2d');
+const W=cv.width, H=cv.height;
+let playing=true, speed=1.0, t=0, last=performance.now();
+const NFULL=36, WIN=7, N0=14, NPTS=9;   // +2 points (denser rising edge)
+const BUILD=11.0, HOLD=2.2, LOOP=BUILD+HOLD;
+const UMIN=-0.25, USPAN=1.25;
+
+function ifg(x){ return Math.cos(2*Math.PI*3.4*x)*Math.exp(-(x*x)/0.40); }
+function decShape(u){ if(u<=0) return 0; return (1-Math.exp(-u/0.06))*Math.exp(-u/0.55)/0.69; }  // steep rise, slow decay (TA-like)
+function xfull(c){ return -1+2*c/NFULL; }
+
+function line(x1,y1,x2,y2,col,w){g.strokeStyle=col||'#5b6673';g.lineWidth=w||1;g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke();}
+function arrow(x1,y1,x2,y2,col,w){line(x1,y1,x2,y2,col,w||1.6);const a=Math.atan2(y2-y1,x2-x1);g.fillStyle=col||'#5b6673';
+  g.beginPath();g.moveTo(x2,y2);g.lineTo(x2-8*Math.cos(a-0.4),y2-8*Math.sin(a-0.4));g.lineTo(x2-8*Math.cos(a+0.4),y2-8*Math.sin(a+0.4));g.closePath();g.fill();}
+function rr(x,y,w,h,r,fill,stroke){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();
+  if(fill){g.fillStyle=fill;g.fill();}if(stroke){g.strokeStyle=stroke;g.lineWidth=1;g.stroke();}}
+function lab(txt,x,y,col,size,al,bold){g.fillStyle=col||'#5b6673';g.font=(bold?'bold ':'')+(size||12)+"px 'Segoe UI'";g.textAlign=al||'center';g.fillText(txt,x,y);}
+function pulse(cx,cy,amp,col,a){g.globalAlpha=a==null?1:a;g.strokeStyle=col;g.lineWidth=1.8;g.beginPath();
+  for(let dx=-11;dx<=11;dx++){const e=Math.exp(-(dx*dx)/(2*5*5));const yy=cy-amp*e*Math.cos(dx*1.6);if(dx===-11)g.moveTo(cx+dx,yy);else g.lineTo(cx+dx,yy);}g.stroke();g.globalAlpha=1;}
+function bsq(x,y){g.save();g.translate(x,y);g.rotate(-Math.PI/4);g.fillStyle='#1d9e75';g.fillRect(-2.5,-12,5,24);g.restore();}
+function mseg(x,y,ang,len,col,w){g.save();g.translate(x,y);g.rotate(ang);g.strokeStyle=col||'#8a96a2';g.lineWidth=w||4;g.lineCap='round';g.beginPath();g.moveTo(-len/2,0);g.lineTo(len/2,0);g.stroke();g.restore();g.lineCap='butt';}
+function getCss(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function hexA(hex,a){hex=hex.replace('#','');const r=parseInt(hex.substr(0,2),16),gg=parseInt(hex.substr(2,2),16),b=parseInt(hex.substr(4,2),16);return'rgba('+r+','+gg+','+b+','+a+')';}
+
+function draw(){
+  g.clearRect(0,0,W,H);
+  const prog=Math.min(t/BUILD,1);
+  const totPts=WIN*NPTS;
+  const pInt=Math.min(Math.floor(prog*totPts),totPts);
+  const locCycle=Math.min(Math.floor(pInt/NPTS),WIN);
+  const sInCyc=pInt-locCycle*NPTS;
+  const scanFrac=Math.min((locCycle+sInCyc/NPTS)/WIN,1);
+
+  // ===================== MODIFIED MACH–ZEHNDER SETUP =====================
+  const M={x:44,y:50,w:528,h:240};
+  rr(M.x-10,M.y-22,M.w+24,M.h+30,11,'#fff','#e7ecf1');
+  lab("Setup : sample + modified Mach–Zehnder interferometer",M.x-2,M.y-6,'#33414f',13.5,'left',true);
+  const BEAM=getCss('--beam');
+  const yH=M.y+108, yB=M.y+170, yPD=M.y+M.h-16;
+  const sx=M.x+96, bx1=M.x+250, bx2=M.x+330, mrx=M.x+438;
+  const stageMirY=(M.y+74) - scanFrac*30;   // moves UPWARD along ↕ as the scan proceeds
+
+  // beams
+  line(M.x+10,yH,bx1,yH,BEAM,2.4);            // laser path -> BS1
+  line(bx1,yH,mrx,yH,BEAM,2.4);               // BS1 -> Mr1 (right arm)
+  line(mrx,yH,mrx,yB,BEAM,2.4);               // Mr1 down -> Mr2
+  line(mrx,yB,bx2,yB,BEAM,2.4);               // Mr2 left -> BS2
+  line(bx1,yH,bx1,stageMirY,BEAM,2.4);        // BS1 up -> roof mirror L
+  line(bx1,stageMirY,bx2,stageMirY,BEAM,2.4); // roof L -> roof R
+  line(bx2,stageMirY,bx2,yB,BEAM,2.4);        // roof R down -> BS2
+  line(bx2,yB,bx2,yPD,BEAM,2.4);              // BS2 -> PD
+
+  // sample
+  rr(sx-6,yH-22,13,44,2,'#79b0ea','#1F5FE0');
+  lab("Sample",sx,yH+40,'#5b6673',12);
+  lab("probe",M.x+30,yH-16,'#5b6673',12,'left');
+
+  // beam splitters
+  bsq(bx1,yH); bsq(bx2,yB);
+  lab("BS",bx1+12,yH+16,'#1d9e75',11,'left'); lab("BS",bx2+12,yB+15,'#1d9e75',11,'left');
+
+  // right mirrors
+  mseg(mrx,yH,Math.PI/4,22,'#8a96a2',4); mseg(mrx,yB,-Math.PI/4,22,'#8a96a2',4);
+  lab("Mirror",mrx+30,yH-6,'#5b6673',11.5,'left');
+
+  // PD
+  rr(bx2-26,yPD-2,52,24,4,'#6b7682','#3a424b'); lab("PD",bx2,yPD+14,'#fff',12,'center',true);
+
+  // moving stage : dark box with two roof mirrors (retroreflector), translating vertically
+  const stX=bx1-34, stW=(bx2-bx1)+68, stTop=stageMirY-20;
+  rr(stX,stTop,stW,34,4,'#586472','#39424d');
+  mseg(bx1,stageMirY,-Math.PI/4,24,'#eef3f7',4);   // roof mirror L  "/"
+  mseg(bx2,stageMirY, Math.PI/4,24,'#eef3f7',4);   // roof mirror R  "\"
+  // up/down arrow = stage direction
+  arrow(bx1-58,stageMirY-3,bx1-58,stageMirY-20,'#16B6E6',3); arrow(bx1-58,stageMirY+3,bx1-58,stageMirY+20,'#16B6E6',3);
+  // red highlight ring
+  g.strokeStyle=getCss('--sig'); g.lineWidth=2.2; g.setLineDash([5,3]);
+  g.beginPath(); g.ellipse(bx1+(stW-68)/2+0, stageMirY, stW/2+12, 26, 0,0,7); g.stroke(); g.setLineDash([]);
+  lab("Moving stage",bx1+18,M.y+8,getCss('--sig'),12.5,'center',true);
+  lab("v",bx1-72,stageMirY+5,'#0E97c4',13,'right',true);
+  lab("continuous scan",stX+stW+8,stageMirY-2,'#0E97c4',11,'left');
+
+  // ===================== OVERVIEW =====================
+  const O={x:592,y:50,w:384,h:240};
+  rr(O.x-10,O.y-22,O.w+24,O.h+30,11,'#fff','#e7ecf1');
+  lab("Overview : interferogram  I(τ)",O.x-2,O.y-6,'#33414f',13.5,'left',true);
+  const ax0=O.x+20, aw=O.w-40, amid=O.y+118, aAmp=66;
+  line(ax0-8,amid,ax0+aw+8,amid,'#e3e8ee',1);
+  g.strokeStyle=hexA(getCss('--ifg'),0.85); g.lineWidth=2; g.beginPath();
+  for(let i=0;i<=220;i++){ const c=i/220*NFULL; const px=ax0+(c/NFULL)*aw, py=amid-ifg(xfull(c))*aAmp;
+    if(i===0)g.moveTo(px,py); else g.lineTo(px,py);} g.stroke();
+  for(let c=N0;c<N0+WIN;c++){ const px=ax0+(c/NFULL)*aw, py=amid-ifg(xfull(c))*aAmp;
+    const done=(c<N0+locCycle)||(c===N0+locCycle && sInCyc>0);
+    g.fillStyle=done?getCss('--sig'):hexA('#9aa7b3',0.6); g.beginPath(); g.arc(px,py,done?3.4:2.4,0,7); g.fill(); }
+  lab("τ",ax0+aw/2,O.y+O.h+2,'#7a8694',11.5);
+  const wxL=ax0+(N0-0.4)/NFULL*aw, wxR=ax0+(N0+WIN-0.6)/NFULL*aw, wyT=amid-aAmp-8, wyB=amid+aAmp+8;
+  g.strokeStyle=getCss('--accent'); g.lineWidth=1.8; g.setLineDash([5,3]); rr(wxL,wyT,wxR-wxL,wyB-wyT,4,null,getCss('--accent')); g.setLineDash([]);
+
+  // ===================== ZOOM DETAIL =====================
+  const Z={x:44,y:322,w:932,h:222};
+  rr(Z.x-10,Z.y-20,Z.w+24,Z.h+28,11,'#fff','#e7ecf1');
+  lab("Zoom : each ASOPS cycle adds one decay  S(τ_n, t)  (recorded from t<0)",Z.x-2,Z.y-4,'#33414f',13.5,'left',true);
+  g.strokeStyle=hexA(getCss('--accent'),0.40); g.lineWidth=1.2; g.setLineDash([5,4]);
+  line(wxL,wyB,Z.x-10,Z.y-20); line(wxR,wyB,Z.x+Z.w+14,Z.y-20); g.setLineDash([]);  // meet the zoom box top corners
+  const zx0=Z.x+46, zw=Z.w-84, zmid=Z.y+106, zAmp=40, zdx=zw/WIN, wdec=zdx*0.82, decAmp=44;
+  const trigY=Z.y+Z.h-24;
+  function baseY(k){ return zmid - ifg(xfull(N0+k))*zAmp; }
+  g.save(); g.translate(Z.x+6,zmid); g.rotate(-Math.PI/2); lab("ΔmOD",0,0,'#7a8694',12); g.restore();
+  line(zx0-14,trigY,zx0+zw+10,trigY,hexA(getCss('--trig'),0.45),1.2);
+  lab("trigger",zx0-18,trigY+4,getCss('--trig'),11,'right');
+  lab("lab. time  (τ steps by Δτ every 1/Δf_r)",zx0+zw/2,Z.y+Z.h+2,'#7a8694',11.5);
+  g.strokeStyle=hexA(getCss('--ifg'),0.45); g.lineWidth=1.5; g.setLineDash([5,4]); g.beginPath();
+  for(let k=0;k<=Math.min(locCycle,WIN-1);k++){ const py=baseY(k); if(k===0)g.moveTo(zx0,py); else g.lineTo(zx0+k*zdx,py);} 
+  if(locCycle>0)g.stroke(); g.setLineDash([]);
+  const lastK=Math.min(locCycle,WIN-1);
+  for(let k=0;k<=lastK;k++){
+    const xk=zx0+k*zdx, by=baseY(k);
+    const ptsHere=(k<locCycle)?NPTS:sInCyc;
+    if(ptsHere<=0) continue;
+    const isCur=(k===locCycle);
+    g.strokeStyle=hexA(getCss('--sig'),isCur?1:0.72); g.lineWidth=isCur?2.4:1.6; g.beginPath();
+    for(let p=0;p<ptsHere;p++){ const u=UMIN+(p/(NPTS-1))*USPAN, px=xk+(u-UMIN)/USPAN*wdec, py=by-decAmp*decShape(u); if(p===0)g.moveTo(px,py); else g.lineTo(px,py);} g.stroke();
+    for(let p=0;p<ptsHere;p++){ const u=UMIN+(p/(NPTS-1))*USPAN, px=xk+(u-UMIN)/USPAN*wdec, py=by-decAmp*decShape(u);
+      const active=(isCur&&p===ptsHere-1);
+      g.fillStyle=hexA(getCss('--sig'),active?1:0.85); g.beginPath(); g.arc(px,py,active?4.4:3.0,0,7); g.fill();
+      if(active){ g.strokeStyle=hexA(getCss('--sig'),0.5); g.lineWidth=1.4; g.beginPath(); g.arc(px,py,9,0,7); g.stroke(); } }
+    g.fillStyle=hexA(getCss('--ifg'),0.5); g.beginPath(); g.arc(xk,by,2,0,7); g.fill();
+    g.strokeStyle=hexA(getCss('--trig'),0.8); g.lineWidth=2; g.beginPath(); g.moveTo(xk,trigY); g.lineTo(xk,trigY-9); g.stroke();
+    if(k<=2||k===WIN-1){ const sub=k===0?"n":("n+"+k); lab("S(τ_"+sub+", t)",xk+wdec*0.5,Z.y+30,getCss('--sig'),12.5); }
+  }
+  if(locCycle>=1){ const xa=zx0, xb=zx0+zdx;
+    g.strokeStyle='#5b6673'; arrow(xa,trigY+18,xb,trigY+18,'#5b6673',1.2); arrow(xb,trigY+18,xa,trigY+18,'#5b6673',1.2);
+    lab("1/Δf_r",(xa+xb)/2,trigY+33,'#5b6673',11); }
+  if(lastK>=0){ lab("t<0",zx0-2,baseY(0)+16,'#9aa7b3',10.5,'left'); }
+
+  // ===================== PULSE TIMING =====================
+  const Pp={x:44,y:566,w:932,h:104};
+  rr(Pp.x-10,Pp.y-16,Pp.w+24,Pp.h+24,11,'#fff','#e7ecf1');
+  lab("Pulse timing  (ASOPS t-scan of the current decay)",Pp.x-2,Pp.y-2,'#33414f',13,'left',true);
+  lab("building  S(τ_"+(locCycle===0?"n":("n+"+Math.min(locCycle,WIN-1)))+", t)",Pp.x+Pp.w+4,Pp.y-2,getCss('--accent'),13,'right',true);
+  const pumpY=Pp.y+40, probeY=Pp.y+78, P=58, px0=Pp.x+70, step=4.4;
+  lab("Pump",Pp.x+2,pumpY-13,'#7a8694',12,'left'); lab("Probe",Pp.x+2,probeY-13,'#7a8694',12,'left');
+  const blink=0.5+0.5*Math.sin(t*16);
+  for(let i=0;i<NPTS;i++){
+    const xp=px0+i*P, xq=px0+i*P-i*step, on=(i===sInCyc && sInCyc<NPTS && locCycle<WIN);
+    if(on){ g.fillStyle=hexA(getCss('--sig'),0.10+0.10*blink); g.beginPath();g.arc((xp+xq)/2,(pumpY+probeY)/2,24,0,7);g.fill(); }
+    pulse(xp,pumpY,17,getCss('--pump'), on?(0.5+0.5*blink):0.85);
+    pulse(xq,probeY,17,getCss('--probe'), on?(0.5+0.5*blink):0.85);
+  }
+  lab("each pair → one point of  S(t)",px0+NPTS*P/2-30,Pp.y+Pp.h-2,'#7a8694',11.5);
+
+  // caption
+  rr(40,H-28,W-80,24,8,'#eef3f8','#d6e0ec');
+  const cap = locCycle>=WIN ? "Boxed portion scanned — decays trace I(τ); the continuous τ-scan then repeats."
+            : "Stage scans τ continuously; each 1/Δf_r records one decay S(τ_n,t) (from t<0), riding on I(τ).";
+  lab(cap,W/2,H-12,'#23406e',13.5,'center',true);
+}
+
+function tick(now){const dt=(now-last)/1000;last=now;
+  if(playing){t+=dt*speed; if(t>=LOOP)t-=LOOP;}
+  draw(); requestAnimationFrame(tick);}
+requestAnimationFrame(tick);
+
+const playB=document.getElementById('play');
+playB.onclick=function(){playing=!playing;playB.innerHTML=playing?'&#10074;&#10074; Pause':'&#9654; Play';};
+document.getElementById('restart').onclick=function(){t=0;};
+const sp=document.getElementById('speed'),spV=document.getElementById('speedV');
+sp.oninput=function(){speed=+sp.value;spV.textContent=speed.toFixed(2)+'×';};
+</script>
+</body>
+</html>

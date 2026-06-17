@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASOPS-TA principle</title>
+<style>
+  :root{--pump:#E2A23B;--probe:#2E9C8E;--sig:#C0392B;--ink:#1d2733;--bg:#fff;--panel:#f7f9fb;--accent:#2E5396;}
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:"Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg);padding:14px;}
+  .wrap{max-width:1040px;margin:0 auto;}
+  h1{font-size:21px;margin:0 0 2px;} h1 small{color:var(--accent);font-weight:600;}
+  .sub{font-size:13.5px;color:#566;margin:0 0 10px;line-height:1.45;}
+  .stage{background:var(--panel);border:1px solid #e4e9ee;border-radius:12px;padding:8px;}
+  canvas{width:100%;height:auto;display:block;}
+  .controls{display:flex;flex-wrap:wrap;gap:14px 20px;align-items:center;margin-top:10px;font-size:13px;background:var(--panel);border:1px solid #e4e9ee;border-radius:10px;padding:10px 14px;}
+  button{font:inherit;font-weight:600;border:1px solid #cdd6df;background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;color:var(--ink);}
+  button:hover{background:#eef3f8;border-color:var(--accent);}
+  .ctl{display:flex;align-items:center;gap:8px;}
+  input[type=range]{width:130px;accent-color:var(--accent);}
+  .val{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:700;min-width:78px;}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:#445;margin-top:8px;}
+  .legend span{display:inline-flex;align-items:center;gap:6px;}
+  .dot{width:13px;height:13px;border-radius:3px;display:inline-block;}
+  .note{font-size:12.5px;color:#667;margin-top:8px;line-height:1.5;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Asynchronous Optical Sampling Transient Absorption &nbsp;<small>(ASOPS-TA / AS-TA)</small></h1>
+  <p class="sub">Pump and probe pulse trains run at slightly different repetition rates,
+     <b>f<sub>r</sub></b> and <b>f<sub>r</sub>+&Delta;f<sub>r</sub></b>. The detuning &Delta;f<sub>r</sub> makes the pump&ndash;probe
+     delay grow by a fixed step <b>&Delta;t</b> every pulse pair, so the transient-absorption decay is sampled
+     <b>point by point</b>. The whole delay window is swept once every <b>1/&Delta;f<sub>r</sub></b>, after which the identical scan repeats.</p>
+
+  <div class="stage"><canvas id="c" width="1020" height="560"></canvas></div>
+
+  <div class="controls">
+    <button id="play">&#10074;&#10074; Pause</button>
+    <button id="restart">&#8635; Restart</button>
+    <div class="ctl"><label>Speed</label>
+      <input type="range" id="speed" min="0.25" max="3" step="0.05" value="1">
+      <span class="val" id="speedV">1.00&times;</span></div>
+    <div class="ctl"><label>Detuning &Delta;f<sub>r</sub></label>
+      <input type="range" id="det" min="1" max="6" step="1" value="3">
+      <span class="val" id="detV"></span></div>
+  </div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--pump)"></i>Pump pulses (f<sub>r</sub>)</span>
+    <span><i class="dot" style="background:var(--probe)"></i>Probe pulses (f<sub>r</sub>+&Delta;f<sub>r</sub>)</span>
+    <span><i class="dot" style="background:var(--sig);border-radius:50%"></i>Sampled TA point</span>
+    <span><i class="dot" style="background:#9aa7b3"></i>Trigger (cross-correlation)</span>
+  </div>
+  <p class="note">Larger &Delta;f<sub>r</sub> &rarr; fewer points per scan (M = f<sub>r</sub>/&Delta;f<sub>r</sub>) and a shorter refresh time 1/&Delta;f<sub>r</sub>,
+     so the delay scan completes and <b>repeats faster</b>. Example: f<sub>r</sub>=80&nbsp;MHz, &Delta;f<sub>r</sub>=800&nbsp;Hz &rarr; M=10<sup>5</sup>,
+     window 1/f<sub>r</sub>=12.5&nbsp;ns scanned every 1/&Delta;f<sub>r</sub>=1.25&nbsp;ms.</p>
+</div>
+
+<script>
+const cv=document.getElementById('c'), g=cv.getContext('2d');
+const W=cv.width, H=cv.height;
+let playing=true, speed=1.0, N=16;
+let k=0, frac=0, scanCount=0, resetFlash=0, detMult=3;
+let hiWinX=null,hiWinY=null,actX=null,actY=null;
+
+function decay(x){const rise=1-Math.exp(-x/0.015);return rise*(0.72*Math.exp(-x/0.16)+0.28*Math.exp(-x/0.62));}
+const A={x:46,y:70,w:430,h:200};
+const B={x:560,y:70,w:430,h:230};
+const T={x:46,y:382,w:944,h:140};
+
+function pulse(cx,cy,amp,col,half){half=half||11;g.strokeStyle=col;g.lineWidth=1.7;g.beginPath();
+  for(let dx=-half;dx<=half;dx+=1){const env=Math.exp(-(dx*dx)/(2*(half/2.3)*(half/2.3)));const yy=cy-amp*env*Math.cos(dx*1.5);
+  if(dx===-half)g.moveTo(cx+dx,yy);else g.lineTo(cx+dx,yy);}g.stroke();}
+function roundLabel(t,x,y,col,size,al){g.fillStyle=col;g.font=(size||12)+"px 'Segoe UI'";g.textAlign=al||'center';g.fillText(t,x,y);}
+
+function draw(){
+  g.clearRect(0,0,W,H);
+  const prog=(k+frac);
+
+  // ===== Pulse timing =====
+  roundRect(A.x-12,A.y-34,A.w+30,A.h+58,12,'#ffffff','#e7ecf1');
+  g.textAlign='left'; g.fillStyle='#33414f'; g.font="bold 13.5px 'Segoe UI'";
+  g.fillText("Pulse timing",A.x-2,A.y-14);
+  roundLabel((scanCount===0?"first cycle":"second cycle"),A.x+A.w+4,A.y-14,getCss('--accent'),13.5,'right');
+
+  const pumpY=A.y+54, probeY=A.y+122;
+  const P=52, x0=A.x+46, nShown=7, step=P/Math.max(N,12);
+  g.strokeStyle='#c4ccd4'; g.lineWidth=1.2;
+  line(A.x, pumpY+26, A.x+A.w, pumpY+26);
+  line(A.x, probeY+26, A.x+A.w, probeY+26);
+  g.fillStyle='#7a8694'; g.font="12px 'Segoe UI'"; g.textAlign='left';
+  g.fillText("Pump",A.x-2,pumpY-22); g.fillText("Probe",A.x-2,probeY-22);
+  for(let i=0;i<nShown;i++){
+    const xp=x0+i*P, xq=x0+i*P-i*step;
+    pulse(xp,pumpY,20,getCss('--pump'),11);
+    pulse(xq,probeY,20,getCss('--probe'),11);
+    if(i>=1&&i<=3){g.strokeStyle='#5b6673';const dy=probeY+26;
+      g.setLineDash([3,3]);line(xq,dy,xq,dy+10);line(xp,dy,xp,dy+10);g.setLineDash([]);
+      arrow(xq,dy+7,xp,dy+7,'#5b6673');roundLabel(i===1?'Δt':i+'Δt',(xp+xq)/2,dy+22,'#5b6673',11);}
+  }
+  const xgap=x0+6*P+34;
+  roundLabel("· · ·",xgap,pumpY+6,'#8a96a2',26);
+  roundLabel("· · ·",xgap,probeY+6,'#8a96a2',26);
+  const ci=Math.min(k,N);          // current sample index (matches the active TA point)
+  let xbox;
+  if(ci<nShown){ xbox=x0+ci*P; }   // pairs 0..6 map one-to-one to the first 7 TA points
+  else { xbox=xgap; }              // beyond the 7 drawn pairs: park the box on the "···"
+  g.strokeStyle=getCss('--sig'); g.lineWidth=2; g.setLineDash([4,3]);
+  g.strokeRect(xbox-16,pumpY-26,32,probeY-pumpY+52); g.setLineDash([]);
+  hiWinX=xbox; hiWinY=probeY+26;
+  roundLabel("τ = "+k+"·Δt",xbox,pumpY-30,getCss('--sig'),11.5);
+  g.strokeStyle='#5b6673'; g.lineWidth=1;
+  arrow(x0,A.y+A.h+18,x0+P,A.y+A.h+18,'#5b6673'); arrow(x0+P,A.y+A.h+18,x0,A.y+A.h+18,'#5b6673');
+  roundLabel("1/f_r",x0+P/2,A.y+A.h+34,'#5b6673',12);
+
+  // ===== TA signal =====
+  roundRect(B.x-14,B.y-34,B.w+40,B.h+74,12,'#ffffff','#e7ecf1');
+  g.textAlign='left'; g.fillStyle='#33414f'; g.font="bold 13.5px 'Segoe UI'";
+  g.fillText("Transient absorption signal (sampled point by point)",B.x-4,B.y-14);
+  const ox=B.x+8, oy=B.y+B.h-10, pw=B.w-20, ph=B.h-26;
+  g.strokeStyle='#c4ccd4'; g.lineWidth=1.4;
+  line(ox,B.y+6,ox,oy); line(ox,oy,ox+pw,oy);
+  g.fillStyle='#7a8694'; g.font="12px 'Segoe UI'"; g.textAlign='center';
+  g.fillText("pump–probe delay  τ",ox+pw/2,oy+30);
+  g.save(); g.translate(B.x-2,B.y+B.h/2); g.rotate(-Math.PI/2); g.fillText("ΔmOD",0,0); g.restore();
+  g.strokeStyle='#eef2f6'; g.lineWidth=1;
+  for(let i=1;i<=4;i++){ line(ox+pw*i/4,B.y+6,ox+pw*i/4,oy); }
+  g.strokeStyle='#c9d3dc'; g.lineWidth=1.6; g.setLineDash([5,4]); g.beginPath();
+  for(let i=0;i<=120;i++){ const xx=i/120; const yy=decay(xx);
+    const px=ox+xx*pw, py=B.y+10+(1-yy)*(ph-14);
+    if(i===0)g.moveTo(px,py); else g.lineTo(px,py);} g.stroke(); g.setLineDash([]);
+  const drawn=Math.min(prog,N);
+  for(let i=0;i<=Math.floor(drawn);i++){
+    const xx=i/N, yy=decay(xx);
+    const px=ox+xx*pw, py=B.y+10+(1-yy)*(ph-14);
+    const active=(i===Math.floor(drawn));
+    g.fillStyle=hexA(getCss('--sig'),active?1:0.9);
+    g.beginPath(); g.arc(px,py,active?5.6:4.2,0,7); g.fill();
+    if(active){ actX=px; actY=py;
+      g.strokeStyle=hexA(getCss('--sig'),0.5); g.lineWidth=1.6;
+      g.beginPath(); g.arc(px,py,9.5,0,7); g.stroke(); }
+  }
+  const curX=Math.min(drawn,N)/N; const sx=ox+curX*pw;
+  g.strokeStyle=hexA(getCss('--sig'),0.4); g.lineWidth=1; g.setLineDash([3,3]);
+  line(sx,B.y+6,sx,oy); g.setLineDash([]);
+  if(resetFlash>0){ g.fillStyle=hexA(getCss('--accent'),0.10*resetFlash); g.fillRect(ox,B.y+6,pw,ph); }
+
+  // ===== Laboratory-time timeline (repeat) =====
+  roundRect(T.x-12,T.y-30,T.w+24,T.h+44,12,'#ffffff','#e7ecf1');
+  g.textAlign='left'; g.fillStyle='#33414f'; g.font="bold 13.5px 'Segoe UI'";
+  g.fillText("Laboratory time  —  the full delay scan repeats every 1/Δf_r",T.x-2,T.y-12);
+  const ty=T.y+86, tx0=T.x+18, tw=T.w-60;
+  g.strokeStyle='#c4ccd4'; g.lineWidth=1.4; line(tx0,ty,tx0+tw,ty);
+  roundLabel("Time",tx0+tw+30,ty+4,'#7a8694',12);
+  const segW=tw*0.46, gapW=tw*0.08; const seg=[tx0, tx0+segW+gapW];
+  const overallProg=(scanCount + drawn/N);
+  for(let s=0;s<2;s++){
+    const bx=seg[s];
+    g.strokeStyle='#9aa7b3'; g.lineWidth=2; line(bx,ty,bx,ty-46);
+    g.fillStyle='#9aa7b3'; g.beginPath(); g.arc(bx,ty-46,3,0,7); g.fill();
+    const fillFrac=Math.max(0,Math.min(1,overallProg-s));
+    g.strokeStyle=hexA(getCss('--sig'), s<Math.floor(overallProg)?0.85:(fillFrac>0?0.85:0.25));
+    g.lineWidth=2; g.beginPath();
+    const npts=Math.max(2,Math.floor(60*fillFrac));
+    for(let i=0;i<=npts;i++){ const xx=i/60; const yy=decay(xx);
+      const px=bx+xx*segW, py=ty-8-yy*60; if(i===0)g.moveTo(px,py); else g.lineTo(px,py);}
+    if(npts>1) g.stroke();
+    if(s===0){ g.strokeStyle='#5b6673'; arrow(bx,ty+22,bx+segW,ty+22,'#5b6673'); arrow(bx+segW,ty+22,bx,ty+22,'#5b6673');
+      roundLabel("1/Δf_r  ( = one delay scan )",bx+segW/2,ty+38,'#5b6673',12); }
+    if(s===1){ roundLabel("…repeats",bx+segW/2,ty+38,'#7a8694',12);}
+    roundLabel(s===0?"0":"1/Δf_r", bx, ty-54, '#7a8694',12);
+  }
+  let cx2; if(overallProg<=1) cx2=seg[0]+overallProg*segW; else cx2=seg[1]+Math.min(overallProg-1,1)*segW;
+  g.strokeStyle=getCss('--accent'); g.lineWidth=1.5; g.setLineDash([4,3]); line(cx2,ty-58,cx2,ty+12); g.setLineDash([]);
+  g.fillStyle=getCss('--accent'); g.beginPath(); g.moveTo(cx2,ty-60); g.lineTo(cx2-5,ty-70); g.lineTo(cx2+5,ty-70); g.closePath(); g.fill();
+
+  // ===== connector: highlighted pulse pair -> sampled TA point =====
+  if(actX!=null && hiWinX!=null){
+    g.strokeStyle=hexA(getCss('--sig'),0.6); g.lineWidth=1.8; g.setLineDash([6,4]);
+    g.beginPath(); g.moveTo(hiWinX,hiWinY);
+    g.bezierCurveTo(hiWinX+30, hiWinY+70, actX-110, actY-30, actX, actY);
+    g.stroke(); g.setLineDash([]);
+    const aa=Math.atan2(30,110); g.fillStyle=hexA(getCss('--sig'),0.85);
+    g.beginPath(); g.moveTo(actX,actY);
+    g.lineTo(actX-10*Math.cos(aa-0.42),actY-10*Math.sin(aa-0.42));
+    g.lineTo(actX-10*Math.cos(aa+0.42),actY-10*Math.sin(aa+0.42)); g.closePath(); g.fill();
+    g.fillStyle=hexA(getCss('--sig'),0.85); g.font="italic 12px 'Segoe UI'"; g.textAlign='center';
+    g.fillText("same delay τ",(hiWinX+actX)/2,(hiWinY+actY)/2+46);
+  }
+}
+
+function line(x1,y1,x2,y2,col,w){g.strokeStyle=col||'#5b6673';g.lineWidth=w||1;g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke();}
+function arrow(x1,y1,x2,y2,col){line(x1,y1,x2,y2,col,1.4);const a=Math.atan2(y2-y1,x2-x1);g.fillStyle=col||'#5b6673';
+  g.beginPath();g.moveTo(x2,y2);g.lineTo(x2-7*Math.cos(a-0.4),y2-7*Math.sin(a-0.4));g.lineTo(x2-7*Math.cos(a+0.4),y2-7*Math.sin(a+0.4));g.closePath();g.fill();}
+function roundRect(x,y,w,h,r,fill,stroke){g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath();
+  if(fill){g.fillStyle=fill;g.fill();}if(stroke){g.strokeStyle=stroke;g.lineWidth=1;g.stroke();}}
+function getCss(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function hexA(hex,a){hex=hex.replace('#','');const r=parseInt(hex.substr(0,2),16),gg=parseInt(hex.substr(2,2),16),b=parseInt(hex.substr(4,2),16);return'rgba('+r+','+gg+','+b+','+a+')';}
+
+let last=performance.now();
+function tick(now){const dt=(now-last)/1000; last=now;
+  if(playing){ frac+=dt*speed*3.2; while(frac>=1){frac-=1;k++;}
+    if(k>=N){k=0;frac=0;scanCount++;resetFlash=1;if(scanCount>=2){scanCount=0;}} }
+  if(resetFlash>0) resetFlash=Math.max(0,resetFlash-dt*2.5);
+  draw(); requestAnimationFrame(tick);}
+requestAnimationFrame(tick);
+
+const playB=document.getElementById('play');
+playB.onclick=function(){playing=!playing;playB.innerHTML=playing?'&#10074;&#10074; Pause':'&#9654; Play';};
+document.getElementById('restart').onclick=function(){k=0;frac=0;scanCount=0;resetFlash=0;};
+const sp=document.getElementById('speed'),spV=document.getElementById('speedV');
+sp.oninput=function(){speed=+sp.value;spV.textContent=speed.toFixed(2)+'×';};
+const det=document.getElementById('det'),detV=document.getElementById('detV');
+function updDet(){detMult=+det.value;N=Math.max(8,Math.round(48/detMult));detV.textContent='×'+detMult+'  (M≈'+N+' pts)';if(k>=N){k=0;frac=0;}}
+det.oninput=updDet; updDet();
+</script>
+</body>
+</html>
